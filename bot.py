@@ -1,192 +1,156 @@
 import os
-import random
-import requests
 import json
-from google import genai
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+import random
+import logging
+import asyncio
+import requests
+import time
+from telegram import Update, Poll, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, PollAnswerHandler, ContextTypes
 
-# 1. क्रेडेंशियल्स (Railway Environment Variables से या यहाँ सीधे डालें)
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "YOUR_BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_KEY")
-GITHUB_JSON_URL = "https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/facts.json"
+# 1. लॉगिंग
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Gemini क्लाइंट
-ai_client = genai.Client(api_key=GEMINI_API_KEY)
+# 2. कॉन्फ़िगरेशन
+TOKEN = "7467353478:AAH9kSAgaEbz3oXjFMbY6w53bqoq4Z2Ssyk"
+GITHUB_URL = "https://raw.githubusercontent.com/jaatpankaj610/paid-quiz-app/main/quiz_database.json"
+WEBHOOK_URL = f"https://bankerbot-mdzw.onrender.com/{TOKEN}"
 
-# यूजर की प्रोग्रेस ट्रैक करने के लिए लोकल मेमोरी
-# (Railway जब तक रीस्टार्ट नहीं होगा, यह याद रखेगा कि कौन से फैक्ट्स आप पढ़ चुके हैं)
-USER_SEEN_FACTS = {}
+DB_CACHE = {}
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/start कमांड दबाने पर"""
-    user_id = str(update.message.from_user.id)
-    # यूजर का नया सेशन शुरू करना
-    USER_SEEN_FACTS[user_id] = []
-    
-    await update.message.reply_text(
-        "👋 राम राम भाई! आपका स्मार्ट फैक्ट-टू-क्विज बोट तैयार है।\n\n"
-        "⏱️ हर बार आपको 20 एकदम नए और अलग तरीके से बने सवाल मिलेंगे।\n"
-        "शुरू करने के लिए `/test` कमांड दबाएं।"
-    )
-
-async def generate_live_quiz(facts_list):
-    """20 फैक्ट्स से Gemini द्वारा लाइव 20 MCQs तैयार करना"""
-    prompt = f"""
-    तुम्हें नीचे दिए गए तथ्यों (Facts) का उपयोग करके 20 बेहतरीन परीक्षा-उपयोगी (Exam-Oriented) बहुविकल्पीय प्रश्न (MCQs) तैयार करने हैं।
-    प्रत्येक फैक्ट से एक प्रश्न बनाना है।
-    
-    सख्त नियम:
-    1. उच्चारण शुद्ध रखने के लिए हिंदी अक्षर 'ड़' की जगह हमेशा 'ड' का प्रयोग करें (जैसे 'बड़ा' की जगह 'बडा', 'पकड़' की जगह 'पकड')।
-    2. आउटपुट केवल और केवल एक वैध JSON Array होना चाहिए, जिसमें कोई अतिरिक्त टेक्स्ट या ```json ``` ब्लॉक न हो।
-    
-    JSON का फॉर्मेट:
-    [
-      {{
-        "question_text": "प्रश्न यहाँ...",
-        "options": ["A) विकल्प 1", "B) विकल्प 2", "C) विकल्प 3", "D) विकल्प 4"],
-        "correct_option": "A"
-      }}
-    ]
-
-    तथ्य (Facts) यहाँ हैं:
-    {json.dumps(facts_list, ensure_ascii=False)}
-    """
-    
-    response = ai_client.models.generate_content(
-        model='gemini-1.5-flash',
-        contents=prompt,
-    )
-    
-    return json.loads(response.text.strip())
-
-async def start_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/test कमांड - 20 नए सवाल लाइव लेकर आना"""
-    user_id = str(update.message.from_user.id)
-    message = update.message
-    
-    await message.reply_text("🔄 GitHub से फैक्ट्स लोड करके AI से नए सवाल बनवा रहा हूँ, कृपया 10-15 सेकंड रुकें...")
-
+def sync_db():
+    """GitHub से तुरंत और पक्का नया डेटा लाने के लिए"""
+    global DB_CACHE
     try:
-        # 1. GitHub से JSON फाइल डाउनलोड करना
-        res = requests.get(GITHUB_JSON_URL)
-        all_facts = res.json()
-        
-        # 2. वो फैक्ट्स निकालना जो यूजर ने पहले नहीं देखे हैं
-        seen_list = USER_SEEN_FACTS.get(user_id, [])
-        unseen_facts = [f for f in all_facts if f not in seen_list]
-        
-        # अगर सारे फैक्ट्स खत्म हो गए हैं तो रीसेट कर दें
-        if len(unseen_facts) < 20:
-            unseen_facts = all_facts
-            seen_list = []
-            await message.reply_text("🔄 आपने सारे फैक्ट्स पढ़ लिए हैं! प्रोग्रेस रीसेट हो रही है, अब दोबारा नए सिरे से सवाल आएंगे।")
-
-        # 3. रैंडम 20 फैक्ट्स चुनना
-        selected_facts = random.sample(unseen_facts, min(20, len(unseen_facts)))
-        
-        # यूजर की सीन लिस्ट में इन्हें जोड़ना ताकि अगली बार ये न आएं
-        seen_list.extend(selected_facts)
-        USER_SEEN_FACTS[user_id] = seen_list
-
-        # 4. AI से लाइव सवाल बनवाना
-        quiz_data = await generate_live_quiz(selected_facts)
-        
-        # टेस्ट का डेटा कॉन्टेक्स्ट में सेव करना ताकि एक-एक करके सवाल दिखा सकें
-        context.user_data['quiz_questions'] = quiz_data
-        context.user_data['current_index'] = 0
-        context.user_data['score'] = 0
-        
-        await send_next_question(message, context)
-
+        # यहाँ '?cache_buster=' लगाया है ताकि GitHub पुराने डेटा को न भेजे
+        headers = {'Cache-Control': 'no-cache'}
+        r = requests.get(f"{GITHUB_URL}?cb={int(time.time())}", headers=headers, timeout=20)
+        if r.status_code == 200:
+            DB_CACHE = r.json()
+            logger.info(f"Sync Successful: {len(DB_CACHE)} topics.")
+            return True
     except Exception as e:
-        await message.reply_text(f"❌ गड़बड़ हो गई भाई! कृपया चेक करें कि GitHub URL सही है या नहीं। Error: {str(e)[:100]}")
+        logger.error(f"Sync Error: {e}")
+        return False
 
-async def send_next_question(message, context: ContextTypes.DEFAULT_TYPE):
-    """अगला सवाल दिखाने के लिए"""
-    questions = context.user_data.get('quiz_questions', [])
-    index = context.user_data.get('current_index', 0)
-    
-    if index >= len(questions):
-        score = context.user_data.get('score', 0)
-        await message.reply_text(f"🏁 **टेस्ट समाप्त भाई!**\n\n📊 आपका स्कोर: {score}/{len(questions)}\n\nअगले 20 नए सवालों के लिए फिर से `/test` दबाएं।")
+# 3. क्विज़ लॉजिक
+async def send_q(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    ud = context.user_data
+    if not ud or 'qs' not in ud: return
+
+    idx = ud.get('idx', 0)
+    qs = ud['qs']
+    total_qs = len(qs) # अब यह ऑटोमैटिक PDF के सारे सवाल गिनेगा
+
+    if idx >= total_qs:
+        score = ud.get('score', 0)
+        await context.bot.send_message(chat_id, f"🎊 **रिवीजन संपन्न!**\n\n📊 आपका स्कोर: `{score}/{total_qs}` सही\n\nनया टॉपिक चुनने के लिए /start दबाएँ।")
+        ud['busy'] = False
         return
 
-    q = questions[index]
-    text = f"📝 **प्रश्न {index + 1}:** {q['question_text']}\n\n"
-    
-    # बटन्स तैयार करना
-    keyboard = []
-    # हर रो में 2 बटन (A और B एक लाइन में, C और D दूसरी लाइन में)
-    keyboard.append([
-        InlineKeyboardButton("A", callback_data=f"ans_A_{q['correct_option']}"),
-        InlineKeyboardButton("B", callback_data=f"ans_B_{q['correct_option']}")
-    ])
-    keyboard.append([
-        InlineKeyboardButton("C", callback_data=f"ans_C_{q['correct_option']}"),
-        InlineKeyboardButton("D", callback_data=f"ans_D_{q['correct_option']}")
-    ])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    # अगर यह पहला सवाल है तो नया मैसेज भेजें, नहीं तो पुराने को एडिट करें
-    if hasattr(message, 'edit_text'):
-        await message.edit_text(text, reply_markup=reply_markup)
-    else:
-        await message.reply_text(text, reply_markup=reply_markup)
+    q = qs[idx]
+    try:
+        # यहाँ 'total_qs' का उपयोग हो रहा है, जो पक्का PDF के कुल सवाल दिखाएगा
+        await context.bot.send_poll(
+            chat_id=chat_id,
+            question=f"✨ ({idx+1}/{total_qs}) {random.choice(q['variations'])}",
+            options=q['options'],
+            type=Poll.QUIZ,
+            correct_option_id=q['answer'],
+            is_anonymous=False,
+            explanation="सही उत्तर आपकी मेहनत का परिणाम है! 📚"
+        )
+        ud['idx'] = idx + 1
+    except Exception as e:
+        logger.error(f"Poll Error: {e}")
 
-async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """जब यूजर A, B, C, D बटन पर क्लिक करे"""
+# 4. हैंडलर्स
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    context.user_data.clear()
+    
+    # अगर शुरू में डेटा नहीं है तो लोड करें
+    if not DB_CACHE: sync_db()
+
+    if not DB_CACHE:
+        await update.message.reply_text("❌ डेटाबेस लोड नहीं हो सका।")
+        return
+
+    icons = ["🔴", "🔵", "🟢", "🟡", "🟣", "💎", "🔥", "🌈"]
+    keyboard = [[InlineKeyboardButton(f"{random.choice(icons)} {t}", callback_data=t)] for t in DB_CACHE.keys()]
+    
+    await update.message.reply_text("🎯 **अपना टॉपिक चुनें:**", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    chat_id = query.message.chat_id
     
-    # डेटा निकालना (जैसे: ans_A_B -> यूजर ने A चुना, सही B था)
-    data = query.data.split('_')
-    user_choice = data[1]
-    correct_choice = data[2]
+    topic_name = query.data
+    # पक्का करना कि उस टॉपिक के सारे सवाल लिस्ट में आएँ
+    all_qs = list(DB_CACHE.get(topic_name, []))
     
-    index = context.user_data.get('current_index', 0)
-    questions = context.user_data.get('quiz_questions', [])
-    q = questions[index]
+    if not all_qs:
+        await query.message.reply_text("❌ इस टॉपिक में कोई सवाल नहीं मिले।")
+        return
+
+    # रैंडम शफल ताकि क्रम बदल जाए पर सवाल सारे रहें
+    random.shuffle(all_qs)
     
-    # सही/गलत का फैसला
-    if user_choice == correct_choice:
-        context.user_data['score'] += 1
-        result_text = f"✅ **सही उत्तर भाई!**\n\n"
+    # यूजर डेटा में पूरे सवाल सेव करना
+    context.user_data.update({
+        'qs': all_qs, 
+        'idx': 0, 
+        'score': 0, 
+        'busy': True
+    })
+    
+    await query.delete_message()
+    # यहाँ यूजर को मैसेज भी दे सकते हैं कि कितने सवाल मिले
+    await context.bot.send_message(chat_id, f"📝 इस टॉपिक में कुल {len(all_qs)} सवाल मिले हैं। चलिए शुरू करते हैं!")
+    await send_q(context, chat_id)
+
+async def handle_ans(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ans = update.poll_answer
+    user_id = ans.user.id
+    ud = context.application.user_data.get(user_id)
+    
+    if ud and ud.get('busy'):
+        idx = ud['idx'] - 1
+        if ans.option_ids[0] == ud['qs'][idx]['answer']:
+            ud['score'] += 1
+        await asyncio.sleep(0.6)
+        await send_q(context, user_id)
+
+async def refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """नया डेटा GitHub से तुरंत खींचने के लिए"""
+    await update.message.reply_text("⏳ GitHub से ताज़ा सवाल लोड किए जा रहे हैं...")
+    if sync_db():
+        # यहाँ कुल टॉपिक्स और कुल सवालों की गिनती दिखाएगा
+        total_questions = sum(len(v) for v in DB_CACHE.values())
+        await update.message.reply_text(f"✅ सिंक सफल!\n📂 कुल टॉपिक्स: {len(DB_CACHE)}\n📚 कुल सवाल: {total_questions}")
     else:
-        result_text = f"❌ **गलत जवाब!**\n\n👉 सही उत्तर **{correct_choice}** था।\n\n"
-        
-    # पुराना सवाल दिखाना और उसके नीचे रिजल्ट जोड़ना
-    full_text = f"📝 **प्रश्न {index + 1}:** {q['question_text']}\n"
-    for opt in q['options']:
-        full_text += f"\n{opt}"
-    
-    full_text += f"\n\n--- \n{result_text}"
-    
-    # अगला सवाल देखने के लिए एक 'Next ➡️' बटन देना
-    keyboard = [[InlineKeyboardButton("अगला प्रश्न ➡️", callback_data="next_question")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(text=full_text, reply_markup=reply_markup)
+        await update.message.reply_text("❌ सिंक फेल हो गया।")
 
-async def next_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """जब यूजर 'Next' बटन दबाए"""
-    query = update.callback_query
-    await query.answer()
-    
-    context.user_data['current_index'] += 1
-    await send_next_question(query.message, context)
-
+# 5. MAIN
 def main():
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
+    sync_db()
+    application = Application.builder().token(TOKEN).build()
+    
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("test", start_test))
-    application.add_handler(CallbackQueryHandler(next_callback, pattern="^next_question$"))
-    application.add_handler(CallbackQueryHandler(handle_answer, pattern="^ans_"))
+    application.add_handler(CommandHandler("refresh", refresh)) # ताज़ा डेटा के लिए
+    application.add_handler(CallbackQueryHandler(handle_topic))
+    application.add_handler(PollAnswerHandler(handle_ans))
 
-    print("🤖 बोट Railway पर लाइव होने के लिए तैयार है...")
-    application.run_polling()
+    port = int(os.environ.get("PORT", 10000))
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path=TOKEN,
+        webhook_url=WEBHOOK_URL,
+        drop_pending_updates=True
+    )
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
